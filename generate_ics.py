@@ -8,15 +8,30 @@ Usage:
 To update the calendar: edit races.csv (add/remove/edit rows), then re-run
 this script and commit+push calendar.ics to GitHub. Anyone subscribed via
 the webcal:// link will see the new events next time their calendar app
-refreshes (refresh interval is set by the calendar app, typically every
-few hours to once a day).
+refreshes (Apple ~hourly, Outlook ~1-4 hrs, Google ~8-24 hrs -- not
+configurable by the publisher).
 
 CSV columns:
-    race_name, country, track, date_2026, all_day, category, notes,
-    heat_sheet_url, watch_url
+    race_id, race_name, year, date, country, track, all_day, category,
+    notes, heat_sheet_url, watch_url
+
+- race_id: stable slug identifying the RACE regardless of year, e.g.
+  "kentucky-derby". Every yearly edition of a race shares the same
+  race_id but is its own row (its own year + date). This is what lets
+  the file hold multiple years of the same race without them colliding
+  or overwriting each other.
+- year / date: date is the full YYYY-MM-DD for that edition; year is
+  redundant with date but kept as its own column to make filtering and
+  sorting by season easy to read/edit by hand.
 
 heat_sheet_url / watch_url are optional -- leave blank until you have them.
 When filled in, they're added as clickable links in the event description.
+
+ROLLING WINDOW: only events within [today - PAST_DAYS, today + FUTURE_DAYS]
+are written to calendar.ics. This keeps the feed from growing forever as
+more years of data accumulate in races.csv -- old editions simply age out
+of the published calendar (they stay in the CSV as history if you want it,
+they just aren't published).
 """
 
 import csv
@@ -28,9 +43,15 @@ HERE = Path(__file__).parent
 CSV_PATH = HERE / "races.csv"
 ICS_PATH = HERE / "calendar.ics"
 
+# Rolling window: don't publish events older or further out than this.
+PAST_DAYS = 90
+FUTURE_DAYS = 548  # ~18 months
+
+
 def esc(text: str) -> str:
     """Escape text per RFC 5545."""
     return (text or "").replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+
 
 def fold(line: str) -> str:
     """Fold lines longer than 75 octets per RFC 5545."""
@@ -44,6 +65,7 @@ def fold(line: str) -> str:
     out.append(cur)
     return "\r\n".join(out)
 
+
 def build_description(row: dict) -> str:
     parts = []
     if row.get("category"):
@@ -56,11 +78,15 @@ def build_description(row: dict) -> str:
         parts.append(f"Watch: {row['watch_url']}")
     return " | ".join(parts)
 
+
 def main():
     with open(CSV_PATH, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    now_stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    now = datetime.utcnow()
+    now_stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    window_start = now - timedelta(days=PAST_DAYS)
+    window_end = now + timedelta(days=FUTURE_DAYS)
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -75,17 +101,33 @@ def main():
         "X-PUBLISHED-TTL:PT12H",
     ]
 
+    included, skipped_out_of_window, skipped_bad_row = 0, 0, 0
+
     for row in rows:
-        name = row["race_name"].strip()
-        if not name:
+        name = (row.get("race_name") or "").strip()
+        race_id = (row.get("race_id") or "").strip()
+        date_str = (row.get("date") or "").strip()
+        if not name or not date_str:
+            skipped_bad_row += 1
             continue
-        date_str = row["date_2026"].strip()
+
         dt = datetime.strptime(date_str, "%Y-%m-%d")
+        if dt < window_start or dt > window_end:
+            skipped_out_of_window += 1
+            continue
+
         dtstart = dt.strftime("%Y%m%d")
         dtend = (dt + timedelta(days=1)).strftime("%Y%m%d")
 
-        uid = str(uuid5(NAMESPACE_DNS, f"{name}-{row['country']}-2026")) + "@g1races"
-        location = f"{row['track']}, {row['country']}"
+        # UID keyed on race_id + the specific year, so each yearly edition
+        # gets a distinct, STABLE id across regenerations (re-running this
+        # script never creates duplicate events in subscribers' calendars,
+        # and never collides two different years of the same race).
+        year = (row.get("year") or date_str.split("-")[0]).strip()
+        uid_key = race_id or name  # fall back to name if race_id missing
+        uid = str(uuid5(NAMESPACE_DNS, f"{uid_key}-{year}")) + "@g1races"
+
+        location = f"{row.get('track','')}, {row.get('country','')}"
         description = build_description(row)
 
         lines.append("BEGIN:VEVENT")
@@ -100,13 +142,20 @@ def main():
         if row.get("heat_sheet_url"):
             lines.append(fold(f"URL:{row['heat_sheet_url']}"))
         lines.append("END:VEVENT")
+        included += 1
 
     lines.append("END:VCALENDAR")
 
     with open(ICS_PATH, "w", newline="", encoding="utf-8") as f:
         f.write("\r\n".join(lines) + "\r\n")
 
-    print(f"Wrote {ICS_PATH} with {len(rows)} events")
+    print(
+        f"Wrote {ICS_PATH}: {included} events published, "
+        f"{skipped_out_of_window} outside the {PAST_DAYS}d-past/"
+        f"{FUTURE_DAYS}d-future window, {skipped_bad_row} skipped "
+        f"(missing name/date)"
+    )
+
 
 if __name__ == "__main__":
     main()
